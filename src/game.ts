@@ -1,0 +1,432 @@
+import { SIM_TICK_MS, TILE_SIZE, CORPSE_LIFE_TICKS, MINE_GOLD_INITIAL, isUnitKind } from './types';
+import type { EntityKind } from './types';
+import { createWorld } from './sim/world';
+import { spawnEntity, entitiesAt, killEntity } from './sim/entities';
+import { processCommand, issueMoveCommand, separateUnits, autoAttackPass } from './sim/commands';
+import { issueAttackCommand } from './sim/combat';
+import { issueGatherCommand, issueTrainCommand, issueBuildCommand, computePopCaps } from './sim/economy';
+import { updateFog } from './sim/fogofwar';
+import { createAI, tickAI, AIController } from './sim/ai';
+import { render } from './render/renderer';
+import { drawUi, drawGhostBuilding, UiButton } from './render/ui';
+import { createCamera, clampCamera, screenToTile, screenToWorld } from './render/camera';
+import { createKeyState } from './input/keyboard';
+import { createMouseState } from './input/mouse';
+import { STATS } from './data/units';
+import { PLAYER_START, AI_START } from './data/maps/map01';
+
+const CAM_SPEED   = 400;
+const EDGE_ZONE   = 20;
+const SELECT_DIST = TILE_SIZE * 0.6;
+const UI_HEIGHT   = 96; // must match render/ui.ts PANEL_H
+
+export function startGame(canvas: HTMLCanvasElement): void {
+  const ctx = canvas.getContext('2d')!;
+
+  const state = createWorld();
+  const cam   = createCamera(
+    Math.max(0, PLAYER_START.x - 8),
+    Math.max(0, PLAYER_START.y - 6),
+  );
+  const keys  = createKeyState();
+  const mouse = createMouseState(canvas);
+
+  // ── Spawn player base ────────────────────────────────────────────────────────
+  spawnEntity(state, 'townhall', 0, PLAYER_START);
+  spawnEntity(state, 'worker',   0, { x: PLAYER_START.x + 4, y: PLAYER_START.y + 1 });
+
+  // ── Spawn gold mines ──────────────────────────────────────────────────────────
+  for (const pos of [
+    { x: 8,  y: 52 },  // near player (primary)
+    { x: 13, y: 55 },  // near player (secondary)
+    { x: 31, y: 32 },  // centre
+    { x: 52, y: 6  },  // near AI (primary)
+    { x: 48, y: 10 },  // near AI (secondary)
+  ]) {
+    const mine = spawnEntity(state, 'goldmine', 0, pos);
+    mine.goldReserve = MINE_GOLD_INITIAL;
+  }
+
+  // ── AI base ───────────────────────────────────────────────────────────────────
+  spawnEntity(state, 'townhall', 1, AI_START);
+  spawnEntity(state, 'worker',   1, { x: AI_START.x + 1, y: AI_START.y + 3 });
+  spawnEntity(state, 'worker',   1, { x: AI_START.x + 2, y: AI_START.y + 3 });
+
+  // ── AI controller ──────────────────────────────────────────────────────────────
+  const ai: AIController = createAI();
+
+  // ── Initial fog reveal (so player base is visible on frame 1) ─────────────────
+  updateFog(state);
+
+  // ── Selection & UI state ──────────────────────────────────────────────────────
+  const selectedIds = new Set<number>();
+  let uiButtons: UiButton[] = [];
+  let placementMode: { building: EntityKind } | null = null;
+  let gameResult: 'playing' | 'win' | 'lose' = 'playing';
+  let attackMoveHeld = false;
+
+  // ── Control groups (Ctrl+1-9 bind, 1-9 recall) ────────────────────────────────
+  // Stores entity-id arrays; double-tap tracks last press time per slot
+  const controlGroups   = new Map<number, number[]>();
+  const lastGroupTap    = new Map<number, number>(); // slot → timestamp ms
+  const DOUBLE_TAP_MS   = 300;
+
+  // ── Resize ────────────────────────────────────────────────────────────────────
+  function resize(): void {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // ── Keyboard ──────────────────────────────────────────────────────────────────
+  window.addEventListener('keydown', (e) => {
+    // ── Control-group bind (Ctrl/Meta + 1-9) ─────────────────────────────────
+    if ((e.ctrlKey || e.metaKey) && e.key >= '1' && e.key <= '9') {
+      e.preventDefault();
+      const slot = parseInt(e.key);
+      const ids  = [...selectedIds].filter(id =>
+        state.entities.some(en => en.id === id && en.owner === 0),
+      );
+      controlGroups.set(slot, ids);
+      return;
+    }
+
+    // ── Control-group recall (1-9 alone) ────────────────────────────────────
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key >= '1' && e.key <= '9') {
+      const slot  = parseInt(e.key);
+      const group = controlGroups.get(slot);
+      if (group) {
+        // Filter out dead entities
+        const alive = group.filter(id => state.entities.some(en => en.id === id));
+        controlGroups.set(slot, alive);
+
+        selectedIds.clear();
+        alive.forEach(id => selectedIds.add(id));
+
+        // Double-tap → center camera on group
+        const now = performance.now();
+        if (now - (lastGroupTap.get(slot) ?? 0) < DOUBLE_TAP_MS && alive.length > 0) {
+          let ax = 0; let ay = 0;
+          alive.forEach(id => {
+            const en = state.entities.find(x => x.id === id);
+            if (en) { ax += en.pos.x; ay += en.pos.y; }
+          });
+          cam.x = ax / alive.length * TILE_SIZE - canvas.width  / 2;
+          cam.y = ay / alive.length * TILE_SIZE - (canvas.height - UI_HEIGHT) / 2;
+        }
+        lastGroupTap.set(slot, now);
+      }
+      return;
+    }
+
+    // ── Global keys ──────────────────────────────────────────────────────────
+    if (e.key === 'Escape') { placementMode = null; return; }
+    if ((e.key === 'r' || e.key === 'R') && gameResult !== 'playing') {
+      window.location.reload(); return;
+    }
+
+    // ── S = Stop all selected player entities ────────────────────────────────
+    if (e.key === 's' || e.key === 'S') {
+      for (const id of selectedIds) {
+        const en = state.entities.find(x => x.id === id && x.owner === 0);
+        if (en) en.cmd = null;
+      }
+      return;
+    }
+
+    // ── Context-sensitive hotkeys based on first selected player entity ───────
+    const firstSel = [...selectedIds]
+      .map(id => state.entities.find(en => en.id === id && en.owner === 0))
+      .find(Boolean);
+
+    if (firstSel) {
+      // Worker build hotkeys
+      if (firstSel.kind === 'worker') {
+        if (e.key === 'b' || e.key === 'B') { placementMode = { building: 'barracks' }; return; }
+        if (e.key === 'f' || e.key === 'F') { placementMode = { building: 'farm' };     return; }
+        if (e.key === 'w' || e.key === 'W') { placementMode = { building: 'wall' };     return; }
+      }
+      // Townhall training hotkey
+      if (firstSel.kind === 'townhall') {
+        if (e.key === 'v' || e.key === 'V') { issueTrainCommand(state, firstSel, 'worker');  return; }
+      }
+      // Barracks training hotkeys — handle A here so it doesn't bleed into attack-move
+      if (firstSel.kind === 'barracks') {
+        if (e.key === 't' || e.key === 'T') { issueTrainCommand(state, firstSel, 'footman'); return; }
+        if (e.key === 'a' || e.key === 'A') { issueTrainCommand(state, firstSel, 'archer');  return; }
+      }
+    }
+
+    // ── A held = attack-move modifier (units only, not caught above) ─────────
+    if (e.key === 'a' || e.key === 'A') attackMoveHeld = true;
+  });
+
+  window.addEventListener('keyup', (e) => {
+    if (e.key === 'a' || e.key === 'A') attackMoveHeld = false;
+  });
+
+  // ── Helpers ───────────────────────────────────────────────────────────────────
+  function isUnit(e: { kind: EntityKind }): boolean { return isUnitKind(e.kind); }
+
+  function unitAtWorld(wx: number, wy: number) {
+    return state.entities.find(e => {
+      if (!isUnit(e)) return false;
+      const ex = (e.pos.x + 0.5) * TILE_SIZE;
+      const ey = (e.pos.y + 0.5) * TILE_SIZE;
+      return Math.hypot(wx - ex, wy - ey) <= SELECT_DIST;
+    });
+  }
+
+  function buildingAtTile(tx: number, ty: number) {
+    return state.entities.find(e =>
+      !isUnit(e) &&
+      tx >= e.pos.x && tx < e.pos.x + e.tileW &&
+      ty >= e.pos.y && ty < e.pos.y + e.tileH,
+    );
+  }
+
+  // ── Input ──────────────────────────────────────────────────────────────────────
+  function handleInput(): void {
+    // Drag-box select (player units only — to avoid accidental mass-enemy-select)
+    for (const drag of mouse.dragSelects) {
+      if (!mouse.shiftHeld) selectedIds.clear();
+      for (const e of state.entities) {
+        if (e.owner !== 0 || !isUnit(e)) continue;
+        const sx = (e.pos.x + 0.5) * TILE_SIZE - cam.x;
+        const sy = (e.pos.y + 0.5) * TILE_SIZE - cam.y;
+        if (sx >= drag.x1 && sx <= drag.x2 && sy >= drag.y1 && sy <= drag.y2) {
+          selectedIds.add(e.id);
+        }
+      }
+    }
+    mouse.dragSelects.length = 0;
+
+    // Click events
+    for (const click of mouse.clicks) {
+      // Check if click hit a UI button (consume, don't pass to world)
+      if (click.button === 0) {
+        const btn = uiButtons.find(b =>
+          click.x >= b.x && click.x <= b.x + b.w &&
+          click.y >= b.y && click.y <= b.y + b.h,
+        );
+        if (btn) {
+          handleUiAction(btn.action);
+          continue;
+        }
+      }
+
+      // Don't process world clicks in the UI panel area
+      if (click.y > canvas.height - UI_HEIGHT) continue;
+
+      const { wx, wy } = screenToWorld(click.x, click.y, cam);
+      const { tx, ty } = screenToTile(click.x, click.y, cam);
+
+      // Placement mode — left-click places building, right-click cancels
+      if (placementMode) {
+        if (click.button === 0) {
+          for (const id of selectedIds) {
+            const worker = state.entities.find(e => e.id === id && e.kind === 'worker' && e.owner === 0);
+            if (worker) {
+              issueBuildCommand(state, worker, placementMode.building, { x: tx, y: ty }, state.tick);
+              break;
+            }
+          }
+          placementMode = null;
+        } else if (click.button === 2) {
+          placementMode = null;
+        }
+        continue;
+      }
+
+      if (click.button === 0) {
+        // Left-click — select ANY entity (enemy units/buildings allowed for info viewing)
+        const hitUnit     = unitAtWorld(wx, wy);
+        const hitBuilding = buildingAtTile(tx, ty);
+        const hit = hitUnit ?? hitBuilding ?? null;
+
+        if (!mouse.shiftHeld) selectedIds.clear();
+        if (hit) selectedIds.add(hit.id);
+
+      } else if (click.button === 2 && selectedIds.size > 0) {
+        // Right-click — order
+        const hitUnit     = unitAtWorld(wx, wy);
+        const hitBuilding = buildingAtTile(tx, ty);
+
+        if (hitUnit && hitUnit.owner === 1) {
+          // Attack enemy unit
+          for (const id of selectedIds) {
+            const attacker = state.entities.find(e => e.id === id && isUnit(e) && e.owner === 0);
+            if (attacker) issueAttackCommand(attacker, hitUnit.id, state.tick);
+          }
+        } else if (hitBuilding && hitBuilding.owner === 1 && hitBuilding.kind !== 'goldmine') {
+          // Attack enemy building (footmen/workers only; archers ignore buildings internally)
+          for (const id of selectedIds) {
+            const attacker = state.entities.find(e => e.id === id && isUnit(e) && e.owner === 0);
+            if (attacker) issueAttackCommand(attacker, hitBuilding.id, state.tick);
+          }
+        } else if (hitBuilding?.kind === 'goldmine') {
+          // Gather gold
+          for (const id of selectedIds) {
+            const worker = state.entities.find(e => e.id === id && e.kind === 'worker' && e.owner === 0);
+            if (worker) issueGatherCommand(worker, hitBuilding.id, state.tick);
+          }
+        } else {
+          // Move (or attack-move if A is held)
+          for (const id of selectedIds) {
+            const mover = state.entities.find(e => e.id === id && isUnit(e) && e.owner === 0);
+            if (mover) issueMoveCommand(state, mover, tx, ty, attackMoveHeld);
+          }
+        }
+      }
+    }
+    mouse.clicks.length = 0;
+
+    // Remove stale selections (dead entities)
+    for (const id of selectedIds) {
+      if (!state.entities.find(e => e.id === id)) selectedIds.delete(id);
+    }
+  }
+
+  function handleUiAction(action: string): void {
+    if (action.startsWith('train:')) {
+      const unit = action.slice(6) as 'worker' | 'footman' | 'archer';
+      for (const id of selectedIds) {
+        const building = state.entities.find(e => e.id === id && !isUnit(e) && e.owner === 0);
+        if (building) { issueTrainCommand(state, building, unit); break; }
+      }
+    } else if (action.startsWith('build:')) {
+      placementMode = { building: action.slice(6) as EntityKind };
+
+    } else if (action === 'stop') {
+      // Cancel current command for all selected player units/buildings
+      for (const id of selectedIds) {
+        const e = state.entities.find(en => en.id === id && en.owner === 0);
+        if (e) e.cmd = null;
+      }
+
+    } else if (action === 'demolish') {
+      // Destroy selected player building and refund 80% of its cost
+      for (const id of selectedIds) {
+        const e = state.entities.find(en => en.id === id && en.owner === 0 && !isUnit(en) && en.kind !== 'goldmine');
+        if (!e) continue;
+        const cost = STATS[e.kind]?.cost ?? 0;
+        state.gold[0] += Math.floor(cost * 0.8);
+        killEntity(state, e.id);
+        selectedIds.delete(id);
+        break;
+      }
+    }
+  }
+
+  // ── Win / lose detection ──────────────────────────────────────────────────────
+  const BLDG_KINDS = new Set(['townhall', 'barracks', 'farm']);
+  function checkWinLose(): void {
+    if (gameResult !== 'playing') return;
+    const hasPlayerTH = state.entities.some(e => e.owner === 0 && e.kind === 'townhall');
+    const hasEnemyBldg = state.entities.some(e => e.owner === 1 && BLDG_KINDS.has(e.kind));
+    if (!hasPlayerTH)  gameResult = 'lose';
+    if (!hasEnemyBldg) gameResult = 'win';
+  }
+
+  // ── Sim tick ───────────────────────────────────────────────────────────────────
+  function simTick(): void {
+    state.tick++;
+    for (const entity of state.entities) processCommand(state, entity);
+    autoAttackPass(state);
+    state.corpses = state.corpses.filter(c => state.tick - c.deadTick < CORPSE_LIFE_TICKS);
+    computePopCaps(state);
+    separateUnits(state);
+    updateFog(state);
+    tickAI(state, ai);
+    checkWinLose();
+  }
+
+  // ── Result overlay ─────────────────────────────────────────────────────────────
+  function drawResultOverlay(): void {
+    if (gameResult === 'playing') return;
+    const w = canvas.width; const h = canvas.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0, 0, w, h);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = gameResult === 'win' ? '#ffe97a' : '#ff5555';
+    ctx.font = 'bold 72px monospace';
+    ctx.fillText(gameResult === 'win' ? 'VICTORY!' : 'DEFEAT', w / 2, h / 2 - 24);
+    ctx.fillStyle = '#ccc';
+    ctx.font = '22px monospace';
+    ctx.fillText('Press R to restart', w / 2, h / 2 + 30);
+    ctx.textAlign = 'left';
+  }
+
+  // ── Drag box overlay ───────────────────────────────────────────────────────────
+  function drawDragBox(): void {
+    const d = mouse.activeDrag;
+    if (!d) return;
+    ctx.strokeStyle = 'rgba(0,255,136,0.85)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+    ctx.fillStyle = 'rgba(0,255,136,0.07)';
+    ctx.fillRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+  }
+
+  // ── Control-group badges (top-left HUD area) ──────────────────────────────────
+  function drawGroupBadges(): void {
+    let gx = 4;
+    controlGroups.forEach((ids, slot) => {
+      if (ids.length === 0) return;
+      const alive = ids.filter(id => state.entities.some(e => e.id === id));
+      if (alive.length === 0) return;
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(gx, 28, 28, 18);
+      ctx.strokeStyle = '#666';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(gx + 0.5, 28.5, 27, 17);
+      ctx.fillStyle = '#ffee88';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${slot}:${alive.length}`, gx + 14, 41);
+      ctx.textAlign = 'left';
+      gx += 32;
+    });
+  }
+
+  // ── Main loop ──────────────────────────────────────────────────────────────────
+  let lastTime = 0;
+  let simAccum = 0;
+
+  function loop(now: number): void {
+    const dt   = Math.min(now - lastTime, 100);
+    lastTime   = now;
+    const viewH = canvas.height;
+
+    const spd  = CAM_SPEED * (dt / 1000);
+    const edge = mouse.onCanvas;
+    if (keys.ArrowLeft  || (edge && mouse.x < EDGE_ZONE))                 cam.x -= spd;
+    if (keys.ArrowRight || (edge && mouse.x > canvas.width  - EDGE_ZONE)) cam.x += spd;
+    if (keys.ArrowUp    || (edge && mouse.y < EDGE_ZONE))                 cam.y -= spd;
+    // ↓ Only scroll down when mouse is in the narrow strip ABOVE the UI panel, not inside it
+    if (keys.ArrowDown  || (edge && mouse.y > viewH - UI_HEIGHT - EDGE_ZONE && mouse.y < viewH - UI_HEIGHT)) cam.y += spd;
+    clampCamera(cam, canvas.width, viewH - UI_HEIGHT);
+
+    handleInput();
+
+    if (gameResult === 'playing') {
+      simAccum += dt;
+      while (simAccum >= SIM_TICK_MS) { simTick(); simAccum -= SIM_TICK_MS; }
+    }
+
+    render(ctx, state, cam, canvas.width, viewH - UI_HEIGHT, selectedIds);
+    if (placementMode) {
+      const { tx, ty } = screenToTile(mouse.x, mouse.y, cam);
+      drawGhostBuilding(ctx, state, cam, placementMode.building, tx, ty);
+    }
+    drawDragBox();
+    uiButtons = drawUi(ctx, state, selectedIds, canvas.width, viewH);
+    drawGroupBadges();
+    drawResultOverlay();
+
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame((t) => { lastTime = t; requestAnimationFrame(loop); });
+}
