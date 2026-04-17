@@ -163,6 +163,20 @@ function drawEntityInfo(
     ctx.fillText(`+4 food slots`, x, panelY + 59);
   }
 
+  // ── Rally point info (townhall + barracks) ─────────────────────────────────
+  if ((e.kind === 'townhall' || e.kind === 'barracks') && e.owner === 0) {
+    ctx.font = '10px monospace';
+    if (e.rallyPoint) {
+      ctx.fillStyle = '#ffe840';
+      ctx.fillText(`Rally → (${e.rallyPoint.x}, ${e.rallyPoint.y})`, x, panelY + 72);
+      ctx.fillStyle = 'rgba(255,255,255,0.28)';
+      ctx.fillText('RMB ground: move rally', x, panelY + 84);
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.28)';
+      ctx.fillText('RMB ground: set rally point', x, panelY + 72);
+    }
+  }
+
   // ── Training progress ───────────────────────────────────────────────────────
   if (e.cmd?.type === 'train') {
     const tStats = STATS[e.cmd.unit];

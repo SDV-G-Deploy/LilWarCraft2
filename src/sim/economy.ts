@@ -157,7 +157,16 @@ export function processTrain(state: GameState, building: Entity): void {
   const sx = building.pos.x + Math.floor(building.tileW / 2);
   const sy = building.pos.y + building.tileH;
   const spawnPos = findSpawnTile(state, sx, sy);
-  spawnEntity(state, cmd.unit, building.owner as 0 | 1, spawnPos);
+  const newUnit  = spawnEntity(state, cmd.unit, building.owner as 0 | 1, spawnPos);
+
+  // Walk to rally point immediately if one is set
+  if (building.rallyPoint) {
+    const rp   = building.rallyPoint;
+    const path = findPath(state, spawnPos.x, spawnPos.y, rp.x, rp.y);
+    if (path && path.length > 0) {
+      newUnit.cmd = { type: 'move', path, stepTick: state.tick, attackMove: false };
+    }
+  }
 
   if (cmd.queue.length > 0) {
     const next = cmd.queue.shift()!;

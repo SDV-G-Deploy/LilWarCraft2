@@ -19,6 +19,40 @@ const FOG_UNSEEN      = 'rgba(0,0,0,1.00)';
 const FOG_EXPLORED    = 'rgba(0,0,0,0.58)';
 const GRID_COLOR      = 'rgba(0,0,0,0.07)';
 
+// ─── Minimap constants (exported so game.ts can share them) ──────────────────
+
+export const MINI_SCALE = 2;                    // px per map tile
+export const MINI_W     = MAP_W * MINI_SCALE;   // 128
+export const MINI_H     = MAP_H * MINI_SCALE;   // 128
+export const MINI_PAD   = 8;                    // gap from canvas edges
+
+/** Terrain colours for the minimap — one fill per tile kind */
+const MINI_TILE_COLORS: Record<TileKind, string> = {
+  grass:    '#3a6a2a',
+  tree:     '#1a4010',
+  water:    '#1a2a6a',
+  rock:     '#5a5050',
+  goldmine: '#7a6a10',
+};
+
+// ─── Minimap terrain cache (built once, tiles never change) ──────────────────
+
+let minimapTerrain: HTMLCanvasElement | null = null;
+
+function buildMinimapTerrain(state: GameState): HTMLCanvasElement {
+  const mc    = document.createElement('canvas');
+  mc.width    = MINI_W;
+  mc.height   = MINI_H;
+  const mctx  = mc.getContext('2d')!;
+  for (let ty = 0; ty < MAP_H; ty++) {
+    for (let tx = 0; tx < MAP_W; tx++) {
+      mctx.fillStyle = MINI_TILE_COLORS[state.tiles[ty][tx].kind];
+      mctx.fillRect(tx * MINI_SCALE, ty * MINI_SCALE, MINI_SCALE, MINI_SCALE);
+    }
+  }
+  return mc;
+}
+
 // ─── Main render ──────────────────────────────────────────────────────────────
 
 export function render(
@@ -38,8 +72,99 @@ export function render(
   drawTiles(ctx, sp, state, cam, viewW, viewH);
   drawCorpses(ctx, sp, state, cam);
   drawEntities(ctx, sp, state, cam, selectedIds);
+  drawRallyPoints(ctx, state, cam, selectedIds);
   drawFog(ctx, state, cam, viewW, viewH);
   drawHUD(ctx, state);
+}
+
+// ─── Minimap ──────────────────────────────────────────────────────────────────
+
+/**
+ * Draw the 128×128 minimap in the bottom-right corner of the game viewport.
+ * Call AFTER render() so it sits on top of the game view.
+ */
+export function drawMinimap(
+  ctx: CanvasRenderingContext2D,
+  state: GameState,
+  cam: Camera,
+  viewW: number,
+  viewH_game: number,
+): void {
+  if (!minimapTerrain) minimapTerrain = buildMinimapTerrain(state);
+
+  const MX = viewW      - MINI_W - MINI_PAD;
+  const MY = viewH_game - MINI_H - MINI_PAD;
+
+  // ── Border frame ─────────────────────────────────────────────────────────
+  ctx.fillStyle   = '#111';
+  ctx.fillRect(MX - 3, MY - 3, MINI_W + 6, MINI_H + 6);
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth   = 1;
+  ctx.strokeRect(MX - 2.5, MY - 2.5, MINI_W + 5, MINI_H + 5);
+  ctx.strokeStyle = '#333';
+  ctx.strokeRect(MX - 1.5, MY - 1.5, MINI_W + 3, MINI_H + 3);
+
+  // ── Terrain layer ─────────────────────────────────────────────────────────
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(minimapTerrain, MX, MY);
+
+  // ── Fog overlay ───────────────────────────────────────────────────────────
+  // 4096 fillRect calls per frame — well within 60fps budget
+  for (let ty = 0; ty < MAP_H; ty++) {
+    for (let tx = 0; tx < MAP_W; tx++) {
+      const fog = state.fog[ty][tx];
+      if (fog === 'visible') continue;
+      ctx.fillStyle = fog === 'unseen'
+        ? 'rgba(0,0,0,0.95)'
+        : 'rgba(0,0,0,0.50)';
+      ctx.fillRect(MX + tx * MINI_SCALE, MY + ty * MINI_SCALE, MINI_SCALE, MINI_SCALE);
+    }
+  }
+
+  // ── Entity dots ───────────────────────────────────────────────────────────
+  for (const e of state.entities) {
+    if (e.kind === 'goldmine') {
+      // Show once explored
+      const fog = state.fog[Math.min(MAP_H - 1, e.pos.y)][Math.min(MAP_W - 1, e.pos.x)];
+      if (fog === 'unseen') continue;
+      ctx.fillStyle = '#ffe840';
+    } else if (e.owner === 1) {
+      // Enemy: obey fog rules (same as entityVisible in main render)
+      const cy  = Math.min(MAP_H - 1, Math.max(0, e.pos.y + Math.floor(e.tileH / 2)));
+      const cx  = Math.min(MAP_W - 1, Math.max(0, e.pos.x + Math.floor(e.tileW / 2)));
+      const fog = state.fog[cy][cx];
+      if (isUnitKind(e.kind) && fog !== 'visible') continue;
+      if (!isUnitKind(e.kind) && fog === 'unseen') continue;
+      ctx.fillStyle = '#ff4444';
+    } else {
+      ctx.fillStyle = '#4488ff'; // player
+    }
+
+    // Units → 2×2 dot; buildings → scaled to footprint
+    const dw = isUnitKind(e.kind) ? MINI_SCALE : e.tileW * MINI_SCALE;
+    const dh = isUnitKind(e.kind) ? MINI_SCALE : e.tileH * MINI_SCALE;
+    ctx.fillRect(
+      MX + e.pos.x * MINI_SCALE,
+      MY + e.pos.y * MINI_SCALE,
+      dw, dh,
+    );
+  }
+
+  // ── Camera viewport rectangle ─────────────────────────────────────────────
+  const vx = (cam.x / TILE_SIZE) * MINI_SCALE;
+  const vy = (cam.y / TILE_SIZE) * MINI_SCALE;
+  const vw = (viewW      / TILE_SIZE) * MINI_SCALE;
+  const vh = (viewH_game / TILE_SIZE) * MINI_SCALE;
+  ctx.strokeStyle = 'rgba(255,255,255,0.80)';
+  ctx.lineWidth   = 1;
+  ctx.strokeRect(MX + vx, MY + vy, vw, vh);
+
+  // ── Label ─────────────────────────────────────────────────────────────────
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.font      = '9px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('MAP', MX + MINI_W - 2, MY + MINI_H - 2);
+  ctx.textAlign = 'left';
 }
 
 // ─── Tiles ────────────────────────────────────────────────────────────────────
@@ -217,11 +342,6 @@ function drawBuilding(
   }
   ctx.drawImage(sprite, sx, sy, pw, ph);
 
-  // Construction overlay (scaffolding hatching while being built)
-  if (e.cmd?.type === 'train') {
-    // no overlay needed for training — building is complete
-  }
-
   // HP bar (buildings get a taller bar for readability)
   drawHpBar(ctx, sx, sy, pw, e.kind === 'wall' ? 3 : 5, e.hp / e.hpMax);
 
@@ -259,6 +379,68 @@ function drawHpBar(
   const col = frac > 0.6 ? '#38cc38' : frac > 0.3 ? '#d8c020' : '#cc2828';
   ctx.fillStyle = col;
   ctx.fillRect(sx, sy - h - 2, Math.round(w * frac), h);
+}
+
+// ─── Rally point markers ──────────────────────────────────────────────────────
+
+/**
+ * Draw a dashed line + gold flag for every selected production building
+ * that has a rally point set. Drawn BEFORE fog so flags in dark territory
+ * get covered naturally.
+ */
+function drawRallyPoints(
+  ctx: CanvasRenderingContext2D,
+  state: GameState,
+  cam: Camera,
+  selectedIds: Set<number>,
+): void {
+  for (const e of state.entities) {
+    if (e.owner !== 0) continue;
+    if (!e.rallyPoint) continue;
+    if (e.kind !== 'townhall' && e.kind !== 'barracks') continue;
+    if (!selectedIds.has(e.id)) continue; // only show for selected buildings
+
+    // Building centre in screen coords
+    const bCX = (e.pos.x + e.tileW / 2) * TILE_SIZE;
+    const bCY = (e.pos.y + e.tileH / 2) * TILE_SIZE;
+    const { sx: bsx, sy: bsy } = worldToScreen(bCX, bCY, cam);
+
+    // Rally tile centre in screen coords
+    const rCX = (e.rallyPoint.x + 0.5) * TILE_SIZE;
+    const rCY = (e.rallyPoint.y + 0.5) * TILE_SIZE;
+    const { sx: rsx, sy: rsy } = worldToScreen(rCX, rCY, cam);
+
+    ctx.save();
+
+    // Dashed line from building centre → rally tile
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = 'rgba(255,220,0,0.65)';
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    ctx.moveTo(bsx, bsy);
+    ctx.lineTo(rsx, rsy);
+    ctx.stroke();
+    ctx.setLineDash([]); // reset
+
+    // Gold flag at rally point (pole + triangle pennant)
+    ctx.fillStyle = '#c8a020';
+    ctx.fillRect(rsx - 1, rsy - 12, 2, 14);     // pole
+    ctx.fillStyle = '#ffe840';
+    ctx.beginPath();
+    ctx.moveTo(rsx + 1, rsy - 12);               // pennant
+    ctx.lineTo(rsx + 9, rsy - 8);
+    ctx.lineTo(rsx + 1, rsy - 4);
+    ctx.closePath();
+    ctx.fill();
+
+    // Small dot at flag base
+    ctx.fillStyle = '#c8a020';
+    ctx.beginPath();
+    ctx.arc(rsx, rsy + 2, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
 }
 
 // ─── Fog ──────────────────────────────────────────────────────────────────────

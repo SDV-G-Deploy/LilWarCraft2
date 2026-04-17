@@ -60,6 +60,7 @@ export interface Entity {
   sightRadius: number;
   goldReserve?: number;   // gold mines only
   carryGold?: number;     // workers carrying gold back
+  rallyPoint?: Vec2;      // townhall / barracks: newly trained units walk here
 }
 
 // ─── Corpse ───────────────────────────────────────────────────────────────────

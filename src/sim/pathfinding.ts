@@ -120,7 +120,7 @@ export function findPath(
     }
 
     // Safety valve — avoid infinite loop on huge open maps
-    if (closed.size > 4096) return null;
+    if (closed.size > MAP_W * MAP_H * 2) return null;
   }
 
   return null;

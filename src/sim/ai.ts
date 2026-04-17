@@ -1,5 +1,5 @@
 import type { Entity, EntityKind, GameState, Vec2 } from '../types';
-import { SIM_HZ } from '../types';
+import { SIM_HZ, isUnitKind } from '../types';
 import { STATS } from '../data/units';
 import {
   issueGatherCommand, issueTrainCommand,
@@ -73,9 +73,13 @@ export function tickAI(state: GameState, ai: AIController): void {
 
     // ── Military: train soldiers, expand pop cap, wait for wave ──────────────
     case 'military': {
-      // Keep filling the barracks queue
+      // Train footmen and archers at roughly 2:1 ratio
       if (myBarracks) {
-        issueTrainCommand(state, myBarracks, 'footman');
+        const footCount   = mySoldiers.filter(u => u.kind === 'footman').length;
+        const archerCount = mySoldiers.filter(u => u.kind === 'archer').length;
+        const wantArcher  = archerCount < Math.floor(footCount / 2) &&
+                            state.gold[1] >= (STATS['archer']?.cost ?? 100);
+        issueTrainCommand(state, myBarracks, wantArcher ? 'archer' : 'footman');
       }
 
       // Build more farms if near pop cap (up to 3 total)
@@ -101,7 +105,12 @@ export function tickAI(state: GameState, ai: AIController): void {
       for (const s of mySoldiers) {
         if (s.cmd && s.cmd.type !== 'move') continue; // already fighting — let combat handle it
 
-        const nearest = nearestPlayerEntity(state, s);
+        // Archers prefer unit targets (they can't attack buildings anyway)
+        // Footmen/workers target nearest entity including buildings
+        const nearest = s.kind === 'archer'
+          ? (nearestPlayerUnit(state, s) ?? nearestPlayerEntity(state, s))
+          : nearestPlayerEntity(state, s);
+
         if (nearest) {
           issueAttackCommand(s, nearest.id, state.tick);
         } else if (playerTH) {
@@ -179,6 +188,18 @@ function nearestPlayerEntity(state: GameState, unit: Entity): Entity | null {
   let bestD = Infinity;
   for (const e of state.entities) {
     if (e.owner !== 0 || e.kind === 'goldmine') continue;
+    const d = Math.hypot(e.pos.x - unit.pos.x, e.pos.y - unit.pos.y);
+    if (d < bestD) { bestD = d; best = e; }
+  }
+  return best;
+}
+
+/** Nearest player-owned mobile unit (archers prefer these over buildings). */
+function nearestPlayerUnit(state: GameState, unit: Entity): Entity | null {
+  let best: Entity | null = null;
+  let bestD = Infinity;
+  for (const e of state.entities) {
+    if (e.owner !== 0 || !isUnitKind(e.kind)) continue;
     const d = Math.hypot(e.pos.x - unit.pos.x, e.pos.y - unit.pos.y);
     if (d < bestD) { bestD = d; best = e; }
   }

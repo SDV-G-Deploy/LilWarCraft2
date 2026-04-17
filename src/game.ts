@@ -7,7 +7,7 @@ import { issueAttackCommand } from './sim/combat';
 import { issueGatherCommand, issueTrainCommand, issueBuildCommand, computePopCaps } from './sim/economy';
 import { updateFog } from './sim/fogofwar';
 import { createAI, tickAI, AIController } from './sim/ai';
-import { render } from './render/renderer';
+import { render, drawMinimap, MINI_SCALE, MINI_W, MINI_H, MINI_PAD } from './render/renderer';
 import { drawUi, drawGhostBuilding, UiButton } from './render/ui';
 import { createCamera, clampCamera, screenToTile, screenToWorld } from './render/camera';
 import { createKeyState } from './input/keyboard';
@@ -202,8 +202,25 @@ export function startGame(canvas: HTMLCanvasElement): void {
     }
     mouse.dragSelects.length = 0;
 
+    // Minimap position (must match drawMinimap formula in renderer.ts)
+    const viewH_game = canvas.height - UI_HEIGHT;
+    const miniX = canvas.width - MINI_W - MINI_PAD;
+    const miniY = viewH_game   - MINI_H - MINI_PAD;
+
     // Click events
     for (const click of mouse.clicks) {
+      // ── Minimap click: scroll camera to clicked tile ────────────────────────
+      if (click.x >= miniX && click.x < miniX + MINI_W &&
+          click.y >= miniY && click.y < miniY + MINI_H &&
+          click.y < viewH_game) {
+        const tileX = (click.x - miniX) / MINI_SCALE;
+        const tileY = (click.y - miniY) / MINI_SCALE;
+        cam.x = tileX * TILE_SIZE - canvas.width  / 2;
+        cam.y = tileY * TILE_SIZE - viewH_game     / 2;
+        clampCamera(cam, canvas.width, viewH_game);
+        continue; // consume click — don't pass to world
+      }
+
       // Check if click hit a UI button (consume, don't pass to world)
       if (click.button === 0) {
         const btn = uiButtons.find(b =>
@@ -252,6 +269,19 @@ export function startGame(canvas: HTMLCanvasElement): void {
         // Right-click — order
         const hitUnit     = unitAtWorld(wx, wy);
         const hitBuilding = buildingAtTile(tx, ty);
+
+        // ── Rally point: right-click empty ground with building(s) selected ───
+        // Both buildings get rally AND any units in mixed selection still move.
+        if (!hitUnit && (!hitBuilding || hitBuilding.kind === 'goldmine')) {
+          for (const id of selectedIds) {
+            const bldg = state.entities.find(e =>
+              e.id === id && e.owner === 0 &&
+              (e.kind === 'townhall' || e.kind === 'barracks'),
+            );
+            if (bldg) bldg.rallyPoint = { x: tx, y: ty };
+          }
+          // Fall through so units in selection also receive the move order
+        }
 
         if (hitUnit && hitUnit.owner === 1) {
           // Attack enemy unit
@@ -416,6 +446,7 @@ export function startGame(canvas: HTMLCanvasElement): void {
     }
 
     render(ctx, state, cam, canvas.width, viewH - UI_HEIGHT, selectedIds);
+    drawMinimap(ctx, state, cam, canvas.width, viewH - UI_HEIGHT);
     if (placementMode) {
       const { tx, ty } = screenToTile(mouse.x, mouse.y, cam);
       drawGhostBuilding(ctx, state, cam, placementMode.building, tx, ty);
