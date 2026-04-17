@@ -16,6 +16,8 @@ import { STATS } from './data/units';
 import { RACES } from './data/races';
 import { buildMap01 } from './data/maps/map01';
 import { buildMap02 } from './data/maps/map02';
+import type { NetSession } from './net/session';
+import { applyNetCmds, type NetCmd } from './net/netcmd';
 
 const CAM_SPEED   = 400;
 const EDGE_ZONE   = 20;
@@ -27,6 +29,8 @@ const UI_HEIGHT   = 96; // must match render/ui.ts PANEL_H
 export interface GameOptions {
   playerRace: Race;
   mapId:      MapId;
+  net?:       NetSession;   // present → online 1v1, no AI
+  myOwner?:   0 | 1;        // which owner this client controls (default 0)
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -54,6 +58,21 @@ export function startGame(
   const playerRC = RACES[options.playerRace];
   const aiRC     = RACES[aiRace];
 
+  // ── Online / offline mode ──────────────────────────────────────────────────
+  const net       = options.net ?? null;
+  const myOwner   = options.myOwner ?? 0;
+  const peerOwner = (myOwner === 0 ? 1 : 0) as 0 | 1;
+  const myRC      = RACES[state.races[myOwner]];
+
+  /**
+   * Emit a command: apply it locally NOW and buffer it to send to peer.
+   * In offline (vs-AI) mode: just apply locally.
+   */
+  function emit(cmd: NetCmd): void {
+    applyNetCmds(state, [cmd], myOwner);
+    net?.push(cmd);
+  }
+
   // Mutable reference so onKeyDown always calls the cleanup-wrapped version
   let backToMenu = onBackToMenu;
 
@@ -78,7 +97,7 @@ export function startGame(
   const ai: AIController = createAI();
 
   // ── Initial fog reveal ─────────────────────────────────────────────────────
-  updateFog(state);
+  updateFog(state, myOwner);
 
   // ── Selection & UI state ───────────────────────────────────────────────────
   const selectedIds = new Set<number>();
@@ -145,16 +164,14 @@ export function startGame(
 
     // S = Stop all selected player entities
     if (e.key === 's' || e.key === 'S') {
-      for (const id of selectedIds) {
-        const en = state.entities.find(x => x.id === id && x.owner === 0);
-        if (en) en.cmd = null;
-      }
+      const ids = [...selectedIds].filter(id => state.entities.some(en => en.id === id && en.owner === myOwner));
+      if (ids.length) emit({ k: 'stop', ids });
       return;
     }
 
-    // Context-sensitive hotkeys — use player's race config
+    // Context-sensitive hotkeys — use this player's race config
     const firstSel = [...selectedIds]
-      .map(id => state.entities.find(en => en.id === id && en.owner === 0))
+      .map(id => state.entities.find(en => en.id === id && en.owner === myOwner))
       .find(Boolean);
 
     if (firstSel) {
@@ -166,12 +183,12 @@ export function startGame(
       }
       // Townhall training — race-appropriate worker
       if (firstSel.kind === 'townhall') {
-        if (e.key === 'v' || e.key === 'V') { issueTrainCommand(state, firstSel, playerRC.worker); return; }
+        if (e.key === 'v' || e.key === 'V') { emit({ k: 'train', buildingId: firstSel.id, unit: myRC.worker });  return; }
       }
-      // Barracks training — handle A here to prevent attack-move bleed
+      // Barracks training
       if (firstSel.kind === 'barracks') {
-        if (e.key === 't' || e.key === 'T') { issueTrainCommand(state, firstSel, playerRC.soldier); return; }
-        if (e.key === 'a' || e.key === 'A') { issueTrainCommand(state, firstSel, playerRC.ranged);  return; }
+        if (e.key === 't' || e.key === 'T') { emit({ k: 'train', buildingId: firstSel.id, unit: myRC.soldier }); return; }
+        if (e.key === 'a' || e.key === 'A') { emit({ k: 'train', buildingId: firstSel.id, unit: myRC.ranged  }); return; }
       }
     }
 
@@ -206,11 +223,11 @@ export function startGame(
 
   // ── Input ──────────────────────────────────────────────────────────────────
   function handleInput(): void {
-    // Drag-box select (player units only)
+    // Drag-box select (my units only)
     for (const drag of mouse.dragSelects) {
       if (!mouse.shiftHeld) selectedIds.clear();
       for (const e of state.entities) {
-        if (e.owner !== 0 || !isUnitKind(e.kind)) continue;
+        if (e.owner !== myOwner || !isUnitKind(e.kind)) continue;
         const sx = (e.pos.x + 0.5) * TILE_SIZE - cam.x;
         const sy = (e.pos.y + 0.5) * TILE_SIZE - cam.y;
         if (sx >= drag.x1 && sx <= drag.x2 && sy >= drag.y1 && sy <= drag.y2) {
@@ -245,10 +262,7 @@ export function startGame(
           click.x >= b.x && click.x <= b.x + b.w &&
           click.y >= b.y && click.y <= b.y + b.h,
         );
-        if (btn) {
-          handleUiAction(btn.action);
-          continue;
-        }
+        if (btn) { handleUiAction(btn.action); continue; }
       }
 
       // Don't process world clicks in the UI panel
@@ -262,9 +276,9 @@ export function startGame(
         if (click.button === 0) {
           for (const id of selectedIds) {
             const worker = state.entities.find(e =>
-              e.id === id && isWorkerKind(e.kind) && e.owner === 0);
+              e.id === id && isWorkerKind(e.kind) && e.owner === myOwner);
             if (worker) {
-              issueBuildCommand(state, worker, placementMode.building, { x: tx, y: ty }, state.tick);
+              emit({ k: 'build', workerId: worker.id, building: placementMode.building, tx, ty });
               break;
             }
           }
@@ -276,7 +290,7 @@ export function startGame(
       }
 
       if (click.button === 0) {
-        // Left-click — select any entity
+        // Left-click — select any entity (local UI only, not synced)
         const hitUnit     = unitAtWorld(wx, wy);
         const hitBuilding = buildingAtTile(tx, ty);
         const hit = hitUnit ?? hitBuilding ?? null;
@@ -291,34 +305,40 @@ export function startGame(
         if (!hitUnit && (!hitBuilding || hitBuilding.kind === 'goldmine')) {
           for (const id of selectedIds) {
             const bldg = state.entities.find(e =>
-              e.id === id && e.owner === 0 &&
+              e.id === id && e.owner === myOwner &&
               (e.kind === 'townhall' || e.kind === 'barracks'),
             );
-            if (bldg) bldg.rallyPoint = { x: tx, y: ty };
+            if (bldg) emit({ k: 'rally', buildingId: bldg.id, tx, ty });
           }
-          // Fall through so units in mixed selection also get move order
         }
 
-        if (hitUnit && hitUnit.owner === 1) {
-          for (const id of selectedIds) {
-            const attacker = state.entities.find(e => e.id === id && isUnitKind(e.kind) && e.owner === 0);
-            if (attacker) issueAttackCommand(attacker, hitUnit.id, state.tick);
-          }
-        } else if (hitBuilding && hitBuilding.owner === 1 && hitBuilding.kind !== 'goldmine') {
-          for (const id of selectedIds) {
-            const attacker = state.entities.find(e => e.id === id && isUnitKind(e.kind) && e.owner === 0);
-            if (attacker) issueAttackCommand(attacker, hitBuilding.id, state.tick);
-          }
+        if (hitUnit && hitUnit.owner === peerOwner) {
+          const attackerIds = [...selectedIds].filter(id => {
+            const e = state.entities.find(en => en.id === id);
+            return e && isUnitKind(e.kind) && e.owner === myOwner;
+          });
+          if (attackerIds.length) emit({ k: 'attack', ids: attackerIds, targetId: hitUnit.id });
+
+        } else if (hitBuilding && hitBuilding.owner === peerOwner && hitBuilding.kind !== 'goldmine') {
+          const attackerIds = [...selectedIds].filter(id => {
+            const e = state.entities.find(en => en.id === id);
+            return e && isUnitKind(e.kind) && e.owner === myOwner;
+          });
+          if (attackerIds.length) emit({ k: 'attack', ids: attackerIds, targetId: hitBuilding.id });
+
         } else if (hitBuilding?.kind === 'goldmine') {
-          for (const id of selectedIds) {
-            const worker = state.entities.find(e => e.id === id && isWorkerKind(e.kind) && e.owner === 0);
-            if (worker) issueGatherCommand(worker, hitBuilding.id, state.tick);
-          }
+          const workerIds = [...selectedIds].filter(id => {
+            const e = state.entities.find(en => en.id === id);
+            return e && isWorkerKind(e.kind) && e.owner === myOwner;
+          });
+          if (workerIds.length) emit({ k: 'gather', ids: workerIds, mineId: hitBuilding.id });
+
         } else {
-          for (const id of selectedIds) {
-            const mover = state.entities.find(e => e.id === id && isUnitKind(e.kind) && e.owner === 0);
-            if (mover) issueMoveCommand(state, mover, tx, ty, attackMoveHeld);
-          }
+          const moverIds = [...selectedIds].filter(id => {
+            const e = state.entities.find(en => en.id === id);
+            return e && isUnitKind(e.kind) && e.owner === myOwner;
+          });
+          if (moverIds.length) emit({ k: 'move', ids: moverIds, tx, ty, atk: attackMoveHeld });
         }
       }
     }
@@ -334,26 +354,22 @@ export function startGame(
     if (action.startsWith('train:')) {
       const unit = action.slice(6) as EntityKind;
       for (const id of selectedIds) {
-        const building = state.entities.find(e => e.id === id && !isUnitKind(e.kind) && e.owner === 0);
-        if (building) { issueTrainCommand(state, building, unit); break; }
+        const building = state.entities.find(e => e.id === id && !isUnitKind(e.kind) && e.owner === myOwner);
+        if (building) { emit({ k: 'train', buildingId: building.id, unit }); break; }
       }
     } else if (action.startsWith('build:')) {
       placementMode = { building: action.slice(6) as EntityKind };
 
     } else if (action === 'stop') {
-      for (const id of selectedIds) {
-        const e = state.entities.find(en => en.id === id && en.owner === 0);
-        if (e) e.cmd = null;
-      }
+      const ids = [...selectedIds].filter(id => state.entities.some(en => en.id === id && en.owner === myOwner));
+      if (ids.length) emit({ k: 'stop', ids });
 
     } else if (action === 'demolish') {
       for (const id of selectedIds) {
         const e = state.entities.find(en =>
-          en.id === id && en.owner === 0 && !isUnitKind(en.kind) && en.kind !== 'goldmine');
+          en.id === id && en.owner === myOwner && !isUnitKind(en.kind) && en.kind !== 'goldmine');
         if (!e) continue;
-        const cost = STATS[e.kind]?.cost ?? 0;
-        state.gold[0] += Math.floor(cost * 0.8);
-        killEntity(state, e.id);
+        emit({ k: 'demolish', buildingId: e.id });
         selectedIds.delete(id);
         break;
       }
@@ -364,23 +380,34 @@ export function startGame(
   const BLDG_KINDS = new Set(['townhall', 'barracks', 'farm']);
   function checkWinLose(): void {
     if (gameResult !== 'playing') return;
-    const hasPlayerTH  = state.entities.some(e => e.owner === 0 && e.kind === 'townhall');
-    const hasEnemyBldg = state.entities.some(e => e.owner === 1 && BLDG_KINDS.has(e.kind));
-    if (!hasPlayerTH)  gameResult = 'lose';
+    const hasMyTH      = state.entities.some(e => e.owner === myOwner   && e.kind === 'townhall');
+    const hasEnemyBldg = state.entities.some(e => e.owner === peerOwner && BLDG_KINDS.has(e.kind));
+    if (!hasMyTH)      gameResult = 'lose';
     if (!hasEnemyBldg) gameResult = 'win';
   }
 
   // ── Sim tick ───────────────────────────────────────────────────────────────
   function simTick(): void {
+    // Apply incoming peer commands for this tick (online mode)
+    if (net) {
+      const remote = net.exchange(state.tick);
+      if (remote) applyNetCmds(state, remote, peerOwner);
+    }
+
     state.tick++;
     for (const entity of state.entities) processCommand(state, entity);
     autoAttackPass(state);
     state.corpses = state.corpses.filter(c => state.tick - c.deadTick < CORPSE_LIFE_TICKS);
     computePopCaps(state);
     separateUnits(state);
-    updateFog(state);
-    tickAI(state, ai);
+    updateFog(state, myOwner);
+    if (!net) tickAI(state, ai);   // AI only runs in offline mode
     checkWinLose();
+
+    // Online: also check if opponent disconnected
+    if (net && net.status === 'disconnected' && gameResult === 'playing') {
+      gameResult = 'win'; // opponent left
+    }
   }
 
   // ── Result overlay ─────────────────────────────────────────────────────────
@@ -462,7 +489,7 @@ export function startGame(
       drawGhostBuilding(ctx, state, cam, placementMode.building, tx, ty);
     }
     drawDragBox();
-    uiButtons = drawUi(ctx, state, selectedIds, canvas.width, viewH);
+    uiButtons = drawUi(ctx, state, selectedIds, canvas.width, viewH, myOwner);
     drawGroupBadges();
     drawResultOverlay();
 
@@ -473,6 +500,7 @@ export function startGame(
   // Re-assign `backToMenu` so the onKeyDown closure picks up the cleanup version
   backToMenu = () => {
     running = false;
+    net?.destroy();
     window.removeEventListener('keydown', onKeyDown);
     window.removeEventListener('keyup',   onKeyUp);
     window.removeEventListener('resize',  resize);

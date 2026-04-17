@@ -9,7 +9,7 @@ import { MAP_W, MAP_H } from '../types';
  *   1. Decay every 'visible' tile → 'explored'  (so tiles you leave go grey)
  *   2. Stamp 'visible' circle around each player-owned entity
  */
-export function updateFog(state: GameState): void {
+export function updateFog(state: GameState, playerOwner: 0 | 1 = 0): void {
   const { fog, entities } = state;
 
   // Step 1 — decay
@@ -21,7 +21,7 @@ export function updateFog(state: GameState): void {
 
   // Step 2 — reveal
   for (const e of entities) {
-    if (e.owner !== 0) continue;   // only player units reveal fog
+    if (e.owner !== playerOwner) continue;   // only this player's entities reveal fog
     const r = e.sightRadius;
     if (r <= 0) continue;
 

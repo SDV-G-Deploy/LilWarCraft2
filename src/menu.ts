@@ -9,15 +9,21 @@ import type { GameOptions } from './game';
 import { RACES } from './data/races';
 import { buildMap01 } from './data/maps/map01';
 import { buildMap02 } from './data/maps/map02';
+import { createSession } from './net/session';
+import type { NetSession } from './net/session';
 
 // ─── State machine ────────────────────────────────────────────────────────────
 
-type MenuScreen = 'title' | 'howtoplay' | 'race' | 'map';
+type MenuScreen = 'title' | 'howtoplay' | 'race' | 'map' | 'online';
 
 interface MenuState {
   screen:      MenuScreen;
   playerRace:  Race;
   mapId:       MapId;
+  // Online lobby
+  netRole?:    'host' | 'guest';
+  netSession?: NetSession;
+  joinCode:    string;      // text being typed in the join field
 }
 
 // ─── Colours ──────────────────────────────────────────────────────────────────
@@ -92,7 +98,25 @@ export function runMenu(
     screen:     'title',
     playerRace: 'human',
     mapId:      1,
+    joinCode:   '',
   };
+
+  // ── Auto-join from URL param (?room=CODE) ──────────────────────────────────
+  const urlParams = new URLSearchParams(window.location.search);
+  const urlRoom   = urlParams.get('room');
+  const urlRace   = (urlParams.get('race') as Race | null) ?? 'human';
+  const urlMap    = parseInt(urlParams.get('map') ?? '1') as MapId;
+  if (urlRoom) {
+    ms.screen     = 'online';
+    ms.netRole    = 'guest';
+    ms.playerRace = urlRace === 'orc' ? 'human' : 'orc'; // guest gets opposite race
+    ms.mapId      = urlMap;
+    ms.joinCode   = urlRoom;
+    ms.netSession = createSession('guest', urlRoom);
+    ms.netSession.onStatusChange = () => {
+      if (ms.netSession?.status === 'ready') startOnlineGame();
+    };
+  }
 
   let buttons: MenuButton[] = [];
   let running = true;
@@ -125,22 +149,82 @@ export function runMenu(
   // ── Action handler ─────────────────────────────────────────────────────────
   function handleAction(action: string): void {
     switch (action) {
-      case 'new_game':   ms.screen = 'race';    break;
-      case 'how_to_play':ms.screen = 'howtoplay';break;
-      case 'back_title': ms.screen = 'title';   break;
-      case 'back_race':  ms.screen = 'race';    break;
-      case 'race_human': ms.playerRace = 'human'; ms.screen = 'map'; break;
-      case 'race_orc':   ms.playerRace = 'orc';   ms.screen = 'map'; break;
-      case 'map_1':      ms.mapId = 1; startGame(); break;
-      case 'map_2':      ms.mapId = 2; startGame(); break;
+      case 'new_game':    ms.screen = 'race';     break;
+      case 'online':      ms.screen = 'online';   break;
+      case 'how_to_play': ms.screen = 'howtoplay';break;
+      case 'back_title':  ms.screen = 'title'; ms.netSession?.destroy(); ms.netSession = undefined; break;
+      case 'back_race':   ms.screen = 'race';     break;
+      case 'race_human':  ms.playerRace = 'human'; ms.screen = 'map'; break;
+      case 'race_orc':    ms.playerRace = 'orc';   ms.screen = 'map'; break;
+      case 'map_1':       ms.mapId = 1; startGame(); break;
+      case 'map_2':       ms.mapId = 2; startGame(); break;
+
+      case 'host_game': {
+        ms.netSession?.destroy();
+        ms.netRole    = 'host';
+        ms.netSession = createSession('host');
+        ms.netSession.onStatusChange = () => {
+          if (ms.netSession?.status === 'ready') startOnlineGame();
+        };
+        break;
+      }
+      case 'join_game': {
+        if (ms.joinCode.length < 4) break;
+        ms.netSession?.destroy();
+        ms.netRole    = 'guest';
+        ms.netSession = createSession('guest', ms.joinCode);
+        ms.netSession.onStatusChange = () => {
+          if (ms.netSession?.status === 'ready') startOnlineGame();
+        };
+        break;
+      }
+      default: {
+        if (action.startsWith('set_race_')) {
+          ms.playerRace = action.slice(9) as Race;
+        } else if (action.startsWith('set_map_')) {
+          ms.mapId = parseInt(action.slice(8)) as MapId;
+        } else if (action.startsWith('copy_link:')) {
+          navigator.clipboard?.writeText(action.slice(10)).catch(() => {});
+        }
+      }
     }
   }
 
-  function startGame(): void {
-    running = false;
+  // ── Keyboard for join-code input ────────────────────────────────────────────
+  function onKeyDown(e: KeyboardEvent): void {
+    if (ms.screen !== 'online') return;
+    if (e.key === 'Backspace') {
+      ms.joinCode = ms.joinCode.slice(0, -1);
+    } else if (e.key.length === 1 && ms.joinCode.length < 36) {
+      ms.joinCode += e.key;
+    } else if (e.key === 'Enter') {
+      handleAction('join_game');
+    }
+  }
+  window.addEventListener('keydown', onKeyDown);
+  const origRemove = () => {
     canvas.removeEventListener('click', onClick);
     window.removeEventListener('resize', resize);
+    window.removeEventListener('keydown', onKeyDown);
+  };
+
+  function startGame(): void {
+    running = false;
+    origRemove();
     onStart({ playerRace: ms.playerRace, mapId: ms.mapId });
+  }
+
+  function startOnlineGame(): void {
+    if (!ms.netSession) return;
+    running = false;
+    origRemove();
+    const myOwner: 0 | 1 = ms.netRole === 'host' ? 0 : 1;
+    onStart({
+      playerRace: ms.playerRace,
+      mapId:      ms.mapId,
+      net:        ms.netSession,
+      myOwner,
+    });
   }
 
   // ── Gradient background ────────────────────────────────────────────────────
@@ -225,7 +309,8 @@ export function runMenu(
 
     const btns: MenuButton[] = [
       { x: cx - 100, y: cy - 20,  w: 200, h: 44, label: '⚔  NEW GAME',    action: 'new_game',    accent: GOLD },
-      { x: cx - 100, y: cy + 36,  w: 200, h: 38, label: '?  HOW TO PLAY', action: 'how_to_play', accent: '#88bbff' },
+      { x: cx - 100, y: cy + 36,  w: 200, h: 38, label: '🌐  ONLINE 1v1',  action: 'online',      accent: '#44ddaa' },
+      { x: cx - 100, y: cy + 86,  w: 200, h: 34, label: '?  HOW TO PLAY', action: 'how_to_play', accent: '#88bbff' },
     ];
 
     buttons = btns;
@@ -563,6 +648,158 @@ export function runMenu(
     buttons = newBtns;
   }
 
+  // ─── Screen: Online Lobby ──────────────────────────────────────────────────
+  function drawOnlineScreen(): void {
+    const cx = canvas.width  / 2;
+    const cy = canvas.height / 2;
+    const newBtns: MenuButton[] = [];
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#44ddaa';
+    ctx.font      = 'bold 28px serif';
+    ctx.fillText('Online 1v1', cx, cy - 160);
+
+    ctx.fillStyle = GREY;
+    ctx.font      = '13px monospace';
+    ctx.fillText('Host a game and share the link, or enter a code to join.', cx, cy - 130);
+
+    // ── HOST panel ─────────────────────────────────────────────────────────────
+    const hx = cx - 280; const hy = cy - 100; const hw = 240; const hh = 200;
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.fillRect(hx, hy, hw, hh);
+    ctx.strokeStyle = '#44ddaa';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(hx + 0.5, hy + 0.5, hw - 1, hh - 1);
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#44ddaa';
+    ctx.font      = 'bold 16px monospace';
+    ctx.fillText('HOST A GAME', hx + hw / 2, hy + 26);
+
+    ctx.fillStyle = GREY;
+    ctx.font      = '11px monospace';
+    ctx.fillText('Pick your race & map first.', hx + hw / 2, hy + 50);
+    ctx.fillText('Then host — share the link.', hx + hw / 2, hy + 65);
+    ctx.fillText('Opponent joins automatically.', hx + hw / 2, hy + 80);
+
+    // Race buttons inside host panel
+    const races: Race[] = ['human', 'orc'];
+    for (let i = 0; i < 2; i++) {
+      const rc  = RACES[races[i]];
+      const bx  = hx + 10 + i * 112;
+      const by  = hy + 96;
+      const sel = ms.playerRace === races[i];
+      ctx.fillStyle = sel ? `${rc.accentColor}44` : 'rgba(0,0,0,0.2)';
+      ctx.fillRect(bx, by, 102, 28);
+      ctx.strokeStyle = sel ? rc.accentColor : '#444';
+      ctx.strokeRect(bx + 0.5, by + 0.5, 101, 27);
+      ctx.fillStyle = sel ? rc.accentColor : GREY;
+      ctx.font = 'bold 12px monospace';
+      ctx.fillText(rc.name, bx + 51, by + 18);
+      newBtns.push({ x: bx, y: by, w: 102, h: 28, label: rc.name, action: `set_race_${races[i]}` });
+    }
+
+    // Map buttons inside host panel
+    for (let i = 0; i < 2; i++) {
+      const mapId = (i + 1) as MapId;
+      const mapName = i === 0 ? 'Verdant Hills' : 'River Crossing';
+      const bx  = hx + 10 + i * 112;
+      const by  = hy + 132;
+      const sel = ms.mapId === mapId;
+      ctx.fillStyle = sel ? '#44446688' : 'rgba(0,0,0,0.2)';
+      ctx.fillRect(bx, by, 102, 28);
+      ctx.strokeStyle = sel ? GOLD : '#444';
+      ctx.strokeRect(bx + 0.5, by + 0.5, 101, 27);
+      ctx.fillStyle = sel ? GOLD : GREY;
+      ctx.font = '11px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(mapName, bx + 51, by + 18);
+      newBtns.push({ x: bx, y: by, w: 102, h: 28, label: mapName, action: `set_map_${mapId}` });
+    }
+
+    const hostBtn: MenuButton = { x: hx + 20, y: hy + hh - 44, w: hw - 40, h: 34, label: 'HOST GAME', action: 'host_game', accent: '#44ddaa' };
+    newBtns.push(hostBtn);
+    drawButton(hostBtn, isHovered(hostBtn));
+
+    // ── If session is active, show status ─────────────────────────────────────
+    if (ms.netSession && ms.netRole === 'host') {
+      const sess = ms.netSession;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = sess.status === 'waiting' ? '#44ddaa' : sess.status === 'error' ? '#ff6666' : '#88ccff';
+      ctx.font      = 'bold 13px monospace';
+      ctx.fillText(sess.statusMsg, hx + hw / 2, hy + hh + 18);
+
+      if (sess.status === 'waiting') {
+        // Build shareable URL
+        const origin = window.location.origin + window.location.pathname;
+        const link   = `${origin}?room=${sess.code}&race=${ms.playerRace}&map=${ms.mapId}`;
+        ctx.fillStyle = WHITE;
+        ctx.font      = '11px monospace';
+        ctx.fillText('Share link:', hx + hw / 2, hy + hh + 36);
+        ctx.fillStyle = '#aaddff';
+        // Truncate for display
+        const display = link.length > 50 ? link.slice(0, 47) + '…' : link;
+        ctx.fillText(display, hx + hw / 2, hy + hh + 52);
+        ctx.fillStyle = GREY;
+        ctx.fillText('(click to copy)', hx + hw / 2, hy + hh + 68);
+
+        // Invisible button for copy-to-clipboard
+        newBtns.push({ x: hx, y: hy + hh + 24, w: hw, h: 50, label: '', action: `copy_link:${link}` });
+      }
+    }
+
+    // ── JOIN panel ─────────────────────────────────────────────────────────────
+    const jx = cx + 40; const jy = cy - 100; const jw = 240; const jh = 200;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.fillRect(jx, jy, jw, jh);
+    ctx.strokeStyle = '#88bbff';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(jx + 0.5, jy + 0.5, jw - 1, jh - 1);
+
+    ctx.fillStyle = '#88bbff';
+    ctx.font      = 'bold 16px monospace';
+    ctx.fillText('JOIN A GAME', jx + jw / 2, jy + 26);
+
+    ctx.fillStyle = GREY;
+    ctx.font      = '11px monospace';
+    ctx.fillText('Enter the room code from', jx + jw / 2, jy + 50);
+    ctx.fillText('the host, or open their link.', jx + jw / 2, jy + 65);
+
+    // Code input display
+    const codeY = jy + 95;
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillRect(jx + 12, codeY, jw - 24, 32);
+    ctx.strokeStyle = '#88bbff';
+    ctx.strokeRect(jx + 12.5, codeY + 0.5, jw - 25, 31);
+    ctx.fillStyle   = ms.joinCode ? WHITE : GREY;
+    ctx.font        = 'bold 14px monospace';
+    ctx.fillText(ms.joinCode || 'type room code…', jx + jw / 2, codeY + 21);
+
+    ctx.fillStyle = GREY;
+    ctx.font      = '10px monospace';
+    ctx.fillText('(keyboard — backspace to delete)', jx + jw / 2, jy + 142);
+
+    const joinBtn: MenuButton = { x: jx + 20, y: jy + jh - 44, w: jw - 40, h: 34, label: 'JOIN GAME', action: 'join_game', accent: '#88bbff' };
+    newBtns.push(joinBtn);
+    drawButton(joinBtn, isHovered(joinBtn));
+
+    if (ms.netSession && ms.netRole === 'guest') {
+      const sess = ms.netSession;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = sess.status === 'error' ? '#ff6666' : '#88ccff';
+      ctx.font      = 'bold 13px monospace';
+      ctx.fillText(sess.statusMsg, jx + jw / 2, jy + jh + 18);
+    }
+
+    // ── Back button ────────────────────────────────────────────────────────────
+    const backBtn: MenuButton = { x: 20, y: 20, w: 90, h: 32, label: '← BACK', action: 'back_title' };
+    newBtns.push(backBtn);
+    drawButton(backBtn, isHovered(backBtn));
+
+    buttons = newBtns;
+  }
+
   // ─── Render loop ───────────────────────────────────────────────────────────
   function frame(): void {
     if (!running) return;
@@ -574,6 +811,7 @@ export function runMenu(
       case 'howtoplay':drawHowToPlay();    break;
       case 'race':     drawRaceSelect();   break;
       case 'map':      drawMapSelect();    break;
+      case 'online':   drawOnlineScreen(); break;
     }
 
     requestAnimationFrame(frame);

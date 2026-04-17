@@ -29,6 +29,7 @@ export function drawUi(
   selectedIds: Set<number>,
   viewW: number,
   viewH: number,
+  myOwner: 0 | 1 = 0,
 ): UiButton[] {
   const panelY = viewH - PANEL_H;
   const buttons: UiButton[] = [];
@@ -55,8 +56,8 @@ export function drawUi(
   if (sel.length === 1) {
     const e = sel[0];
     drawPortrait(ctx, e, panelY);
-    drawEntityInfo(ctx, e, state, panelY, PORTRAIT_W + BTN_PAD);
-    collectButtons(ctx, e, state, panelY, viewW, buttons);
+    drawEntityInfo(ctx, e, state, panelY, PORTRAIT_W + BTN_PAD, myOwner);
+    collectButtons(ctx, e, state, panelY, viewW, buttons, myOwner);
   } else {
     // Multiple — show small icons for each
     sel.slice(0, 10).forEach((e, i) => {
@@ -119,6 +120,7 @@ function drawEntityInfo(
   state: GameState,
   panelY: number,
   x: number,
+  myOwner: 0 | 1 = 0,
 ): void {
   const stats = STATS[e.kind];
   const rc    = ownerRace(state.races, e.owner);
@@ -177,14 +179,14 @@ function drawEntityInfo(
   }
 
   // ── Pop + treasury (player-owned, non-goldmine) ─────────────────────────────
-  if (e.owner === 0 && e.kind !== 'goldmine') {
-    const popFull = state.pop[0] >= state.popCap[0];
+  if (e.owner === myOwner && e.kind !== 'goldmine') {
+    const popFull = state.pop[myOwner] >= state.popCap[myOwner];
     ctx.fillStyle = popFull ? '#ff6666' : '#88ff88';
     ctx.font = '11px monospace';
-    ctx.fillText(`Pop: ${state.pop[0]}/${state.popCap[0]}`, x, y);
+    ctx.fillText(`Pop: ${state.pop[myOwner]}/${state.popCap[myOwner]}`, x, y);
     ctx.fillStyle = '#ffe97a';
     ctx.font = 'bold 12px monospace';
-    ctx.fillText(`${state.gold[0]}g`, x + 90, y);
+    ctx.fillText(`${state.gold[myOwner]}g`, x + 90, y);
     y += LINE;
   }
 
@@ -265,7 +267,7 @@ function drawEntityInfo(
   }
 
   // ── Idle hint (player units only) ───────────────────────────────────────────
-  if (e.owner === 0 && !e.cmd && stats && stats.speed > 0) {
+  if (e.owner === myOwner && !e.cmd && stats && stats.speed > 0) {
     ctx.fillStyle = 'rgba(255,255,255,0.35)';
     ctx.font = '10px monospace';
     ctx.fillText('RMB: Move/Attack/Gather   A+RMB: Atk-Move', x, panelY + PANEL_H - 8);
@@ -279,10 +281,11 @@ function collectButtons(
   panelY: number,
   viewW: number,
   buttons: UiButton[],
+  myOwner: 0 | 1 = 0,
 ): void {
-  if (e.owner !== 0) return; // no buttons for enemy entities
+  if (e.owner !== myOwner) return; // no buttons for enemy entities
 
-  const rc        = RACES[state.races[0]]; // player race config
+  const rc        = RACES[state.races[myOwner]]; // player race config
   const btnStartX = viewW - (BTN_W + BTN_PAD) * MAX_BTN_COLS;
   let col = 0;
 
@@ -298,15 +301,15 @@ function collectButtons(
   if (e.kind === 'townhall') {
     const workerCost = STATS[rc.worker]?.cost ?? 50;
     addButton(`${rc.workerLabel} [V]\n[${workerCost}g]`, `train:${rc.worker}`,
-      state.gold[0] < workerCost);
+      state.gold[myOwner] < workerCost);
   }
   if (e.kind === 'barracks') {
     const soldierCost = STATS[rc.soldier]?.cost ?? 80;
     const rangedCost  = STATS[rc.ranged]?.cost  ?? 100;
     addButton(`${rc.soldierLabel} [T]\n[${soldierCost}g]`, `train:${rc.soldier}`,
-      state.gold[0] < soldierCost);
+      state.gold[myOwner] < soldierCost);
     addButton(`${rc.rangedLabel} [A]\n[${rangedCost}g]`, `train:${rc.ranged}`,
-      state.gold[0] < rangedCost);
+      state.gold[myOwner] < rangedCost);
   }
 
   // ── Worker build menu (workers + peons both show build buttons) ─────────────
@@ -316,9 +319,9 @@ function collectButtons(
     const wallCost = STATS['wall']?.cost     ?? 50;
     const barrLabel = rc.barrLabel;
     const farmLabel = rc.farmLabel;
-    addButton(`${barrLabel} [B]\n[${barrCost}g]`, 'build:barracks', state.gold[0] < barrCost);
-    addButton(`${farmLabel} [F]\n[${farmCost}g]`, 'build:farm',     state.gold[0] < farmCost);
-    addButton(`Wall [W]\n[${wallCost}g]`,          'build:wall',     state.gold[0] < wallCost);
+    addButton(`${barrLabel} [B]\n[${barrCost}g]`, 'build:barracks', state.gold[myOwner] < barrCost);
+    addButton(`${farmLabel} [F]\n[${farmCost}g]`, 'build:farm',     state.gold[myOwner] < farmCost);
+    addButton(`Wall [W]\n[${wallCost}g]`,          'build:wall',     state.gold[myOwner] < wallCost);
   }
 
   // ── Stop (any player unit/building with an active command) ──────────────────
